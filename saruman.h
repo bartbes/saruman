@@ -36,7 +36,7 @@
 #define __NR_exit 60
 
 #define __PAYLOAD_ATTRIBUTES__	 __attribute__((aligned(8),__always_inline__))
-#define __PAYLOAD_KEYWORDS__ static inline volatile
+#define __PAYLOAD_KEYWORDS__ static inline
 
 #define PT_ATTACHED 1
 #define PT_DETACHED 2
