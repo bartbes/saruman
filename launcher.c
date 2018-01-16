@@ -1281,8 +1281,6 @@ int fixup_got(handle_t *h)
 		exit(-1);
 	}
 
-	get_libc_addr(h->tasks.pid);
-
 	int fd;
 	struct stat st;
 
@@ -1673,6 +1671,8 @@ int main(int argc, char **argv)
 
 	parasite.tasks.pid = atoi(args[0]);
 	printf("[+] Target pid: %d\n", parasite.tasks.pid);
+
+	get_libc_addr(parasite.tasks.pid);
 
 	if (opts.no_dlopen) {
 		printf("Calling randomize base\n");
